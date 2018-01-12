@@ -72,6 +72,11 @@
 # 2015-05-01: Minimal fix to support new link format for the login page
 # 2015-05-16: Updated to comply with changes to grabber
 # 2016-01-16: Updated to comply with changes to grabber (again)
+# 2016-12-29: Fix "bad substitution" error in Debian Stretch Bash
+# 2017-02-03: Support for accounts with multiple phone numbers
+#             In related news: support for the minemeldinger.no API in development
+# 2017-07-21: Code cleanup, hopefully no functional changes
+# 2017-11-19: Implemented support for Telenor's new oAuth login
 #
 
 
@@ -111,7 +116,8 @@ config="$HOME/.${_scriptname}"
 
 
 # Smart Sourcing
-function ssource {
+function ssource
+{
     while (( $# )); do
         if [[ -f "$1" ]] && [[ -r "$1" ]]; then
             source "$1"
@@ -124,7 +130,7 @@ function ssource {
 
 
 # Grabber
-grabber=$(grep -m 1 "^grabber=" $config 2>/dev/null | cut -d = -f 2)
+grabber=$(grep -m 1 "^grabber=" "$config" 2>/dev/null | cut -d = -f 2)
 if ! ssource /cathedral/src/lib/grabber "${grabber:-"$HOME/.grabber"}" "$(dirname "${BASH_SOURCE[0]}")/grabber"; then
 	echo "grabber library was not found" >&2
 	echo "Please download \"grabber\" from the same place you got this script," >&2
@@ -134,8 +140,9 @@ fi
 
 
 # Config
-username=$(grep -m 1 "^username=" $config 2>/dev/null | cut -d = -f 2 | sf_urlencode)
-password=$(grep -m 1 "^password=" $config 2>/dev/null | cut -d = -f 2 | sf_urlencode)
+username=$(grep -m 1 "^username=" "$config" 2>/dev/null | cut -d = -f 2 | sf_urlencode)
+password=$(grep -m 1 "^password=" "$config" 2>/dev/null | cut -d = -f 2 | sf_urlencode)
+subscription=$(grep -m 1 "^subscription=" "$config" 2>/dev/null | cut -d = -f 2)
 [[ -z "${1:-}" ]] || { recipient=$1 && shift; }
 [[ -z "${1:-}" ]] || { message=$(sf_urlencode "$@"); }
 
@@ -151,19 +158,52 @@ if [[ -z "${recipient:-}" ]] || [[ -z "${message:-}" ]]; then
 fi
 
 
+# Get login URL
+grabber_task "Getting login URL"
+grab -hrn "https://www.telenor.no/privat/minesider/logginn" || :
+cat "$f_stderr" >>"$f_stdout"
+assert 'Location: '
+read -r login_url < <(grep -m 1 "Location: " <"$f_stdout" | cut -d ':' -f 2- | tr -d '\r\n') || :
+
+
 # Get cookie
 grabber_task "Getting cookie"
-grab "https://www.telenor.no/privat/minesider/logginnfelles.cms"
-assert 'action="/privat/minesider/logginnfelles.cms'
+grab "$login_url"
+assert 'action="#"'
 
 
 # Login
 grabber_task "Logging in"
+grab_data="username=$username&password=$password" \
+grab_ref="$login_url" \
+grab "$login_url"
+assert "Authentication successful"
+
+
+# Get form data
+grabber_task "Getting form data"
+function field_value
+{
+	local name=$1
+	local regex="<input[^>]+name=\"$name\"[^>]+value=\"([^\"]+)"
+	if [[ "$(tr -d '\r\n' <"$f_stdout")" =~ $regex ]]; then
+		printf '%s' "${BASH_REMATCH[1]}"
+	else
+		grabber_fail
+	fi
+}
+fdata_1=$(field_value "samlResponse")
+fdata_2=$(field_value "telenor_id")
+fdata_3=$(field_value "last_success_login_date")
+grabber_ok
+
+# Login
+grabber_task "Accessing service"
 up=false
 while true; do
-	grab_data="usr_name=$username&usr_password=$password&lbAction=Logg+inn" \
-	grab_ref="https://www.telenor.no/privat/minesider/logginnfelles.cms" \
-	grab "https://www.telenor.no/privat/minesider/logginnfelles.cms"
+	grab_data="samlResponse=$(sf_urlencode "${fdata_1}")&telenor_id=$(sf_urlencode "${fdata_2}")&last_success_login_date=$(sf_urlencode "${fdata_3}")" \
+	grab_ref="$login_url" \
+	grab "https://apigw.telenor.no/oauth/v2/storeSaml"
 	if found 'SEND_SMS'; then
 		echo "OK"
 		break
@@ -184,14 +224,60 @@ while true; do
 done
 
 
-# Mandatory SMS page get...
-grabber_task "SMS page get"
+# Subscription test
+grabber_task "Looking for subscription"
+smsurl="https://www.telenor.no/privat/minesider/norm/win/sms/send.do"
 grab_ref="https://www.telenor.no/privat/minesider/minside/minSidePage.cms" \
-grab "https://www.telenor.no/privat/minesider/norm/win/sms/send.do"
+grab "$smsurl"
 if found '<h1>Teknisk feil</h1>'; then
 	grabber_fail '"Teknisk feil" - Have you activated SMS from Web yet?'
 fi
-assert 'action="/norm/win/sms/send/process.do"'
+if found '/selectSubscription/process.do'; then
+	>"$f_stderr" # hijack this
+	echo 'It would seem you have more than one subscription' >>"$f_stderr"
+	echo 'Please add one of the following "subscription=..." lines to your configuration file:' >>"$f_stderr"
+	while IFS=$'\t' read -r sub ref; do
+		if [[ "$sub" = "${subscription:-x}" ]]; then
+			smsurl="https://telenormobil.no$ref"
+			break
+		fi
+		echo "subscription=$sub" >>"$f_stderr"
+	done < <(
+		grep '/selectSubscription/process.do' "$f_stdout" | cut -d '"' -f 2,4 --output-delimiter=$'\t' | tr -d ' '
+	)
+
+	# list subscriptions available
+	if [[ -z "$smsurl" ]]; then
+		echo "???" >&2
+		cat "$f_stderr" >&2
+		exit 1
+	fi
+
+	# attempt to select subscription
+	grabber_ok
+	grabber_task "Number verification"
+	select_url=$smsurl
+	for (( i=0; i<10; i++)); do
+		grab -hrn "$select_url" || :
+		cat "$f_stderr" >>"$f_stdout"
+		read -r select_url < <(grep -m 1 "Location: " <"$f_stdout" | cut -d ':' -f 2- | tr -d '\r\n') || :
+		if [[ "$select_url" = *"send.do" ]]; then
+			break
+		fi
+	done
+	if [[ "$select_url" != *"send.do" ]]; then
+		echo "???" >&2
+		echo "Failed to select number for sending - have you send a message manually and verified the code yet?" >&2
+		exit 1
+	fi
+fi
+grabber_ok
+
+
+# Mandatory SMS page get...
+grabber_task "SMS page get"
+grab "$smsurl"
+assert '/send/process.do'
 
 
 # Get the address list
@@ -220,11 +306,11 @@ while read -r line; do
 	fi
 done <"$f_stdout"
 grabber_ok
-echo "Read ${#names[@]:-} entries from address list."
+echo "Read ${#names[@]} entries from address list."
 
 
 # Translate recipients given as names to numbers in the address list
-for (( i=0; i<${#names[@]:-}; i++ )); do
+for (( i=0; i<${#names[@]}; i++ )); do
 	if [[ "${recipient,,}" = "${names[i],,}" ]]; then
 		recipient=${numbers[i]}
 		break
@@ -234,7 +320,7 @@ done
 
 # Translate recipients given as partial numbers (or translated above) to full numbers and announce
 match=false
-for (( i=0; i<${#numbers[@]:-}; i++ )); do
+for (( i=0; i<${#numbers[@]}; i++ )); do
 	if
 		[[ "$recipient" = *"${numbers[i]}"* ]] ||
 		[[ "${numbers[i]}" = *"$recipient"* ]]

@@ -5,14 +5,14 @@
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/gpl-2.0.html>,
 # or in pdf format at <http://www.dhampir.no/stuff/private/gpl-2.0.pdf>
 
-# Copyright 2014 - Øyvind 'bolt' Hvidsten   <bolt@dhampir.no>
+# Copyright 2014 - Øyvind 'bolt' Hvidsten	<bolt@dhampir.no>
 
 # Description:
 #
@@ -38,6 +38,8 @@
 # 2015-08-22: Added support for $grab_method
 # 2015-08-26: Added support for $grab_auth
 # 2016-01-16: Renamed "encode" function to match shellfunc naming
+# 2016-06-22: Added "silent" and "show-error" to avoid having progress output in the stderr file
+# 2017-11-19: Added support for fetching headers only, and for avoiding redirection
 #
 
 
@@ -72,46 +74,78 @@ function grab
 {
 	>"$f_stdout"
 	>"$f_stderr"
-	local i
 	local agent=${GRABBER_AGENT:-"Mozilla/5.0 (X11; Linux i686; rv:6.0) Gecko/20100101 Firefox/6.0"}
 	local timeout=${GRABBER_TIMEOUT:-30}
 	local retries=${GRABBER_RETRIES:-3}
+	local compressed; if ${GRABBER_COMPRESSED:-true}; then compressed="x"; else compressed=""; fi
+
+	local header_only=""
+	local no_redirect=""
+	local redirect="x"
+	local fail=true
+	OPTIND=1
+	while getopts ":hrn" opt; do
+		case "$opt" in
+			h) header_only="x" ;;
+			r) no_redirect="x"; redirect="" ;;
+			n) fail=false ;;
+			[?])
+				echo "Unknown option -${OPTARG}" >&2
+				exit 1
+			;;
+			:)
+				echo "Option -${OPTARG} requires an argument" >&2
+				exit 1
+			;;
+		esac
+	done
+	shift $((OPTIND-1))
+	if [[ "${1:-}" = "--" ]]; then shift; fi
+
 	{
 		case "${GRABBER:-curl}" in
 			curl)
 				_grabber_grab curl \
-					--location \
+					${redirect:+--location --max-redirs 25} \
 					--insecure \
-					--cookie $f_cookies \
-					--cookie-jar $f_cookies \
+					--cookie "$f_cookies" \
+					--cookie-jar "$f_cookies" \
 					--speed-limit 1 \
-					--speed-time $timeout \
-					--connect-timeout $timeout \
-					--retry $retries \
+					--speed-time "$timeout" \
+					--connect-timeout "$timeout" \
+					--retry "$retries" \
 					--user-agent "$agent" \
+					--silent --show-error \
 					${grab_proto:+-"$grab_proto"} \
 					${grab_data:+--data "$grab_data"} \
 					${grab_ref:+--referer "$grab_ref"} \
 					${grab_head:+--header "$grab_head"} \
 					${grab_method:+--request "$grab_method"} \
 					${grab_auth:+--user "$grab_auth"} \
+					${compressed:+--compressed} \
+					${no_redirect:+--max-redirs 0} \
+					${header_only:+-I} \
 					"$@" >"$f_stdout" 2>"$f_stderr"
 			;;
 			wget)
 				_grabber_grab wget -O- \
 					--no-check-certificate \
-					--load-cookies=$f_cookies \
-					--save-cookies=$f_cookies \
+					--load-cookies="$f_cookies" \
+					--save-cookies="$f_cookies" \
 					--keep-session-cookies \
-					--timeout $timeout \
-					--tries $retries \
+					--timeout "$timeout" \
+					--tries "$retries" \
 					--user-agent="$agent" \
+					--no-verbose \
 					${grab_proto:+-"$grab_proto"} \
 					${grab_data:+--post-data="$grab_data"} \
 					${grab_ref:+--referer="$grab_ref"} \
 					${grab_head:+--header="$grab_head"} \
 					${grab_method:+--method="$grab_method"} \
 					${grab_auth:+--user="${grab_auth%%:*}" --password="${grab_auth#*:}"} \
+					${no_redirect:+--max-redirect=0} \
+					${redirect:+--max-redirect=25} \
+					${header_only:+-S --spider} \
 					"$@" >"$f_stdout" 2>"$f_stderr"
 			;;
 			*)
@@ -121,7 +155,7 @@ function grab
 		esac
 	} && grab_status=$? || grab_status=$?
 	(( grab_status )) || return 0
-	grabber_fail
+	! $fail || grabber_fail
 }
 
 
@@ -140,7 +174,7 @@ function assert
 		_grabber_silent || echo "OK"
 	else
 		_grabber_silent || echo "Failed!"
-		echo "Exiting due to failed assertion (${@})" >&2
+		echo "Exiting due to failed assertion (${*})" >&2
 		_grabber_debugfail
 		${GRABBER_EXIT:-true} && exit 1 || return 1
 	fi
@@ -150,7 +184,8 @@ function assert
 # Simple URL encoding - just encode everything
 function sf_urlencode
 {
-	local encoded=$(xxd -plain <<<"${@:-$(cat)}" | tr -d '\n' | sed 's/\(..\)/%\1/g')
+	local encoded
+	encoded=$(xxd -plain <<<"${*:-$(cat)}" | tr -d '\n' | sed 's/\(..\)/%\1/g')
 	echo "${encoded%\%0a}"
 }
 
@@ -158,7 +193,7 @@ function sf_urlencode
 # Debug printing
 function grabber_debug
 {
-	! ${DEBUG:-false} || echo "Debug: $@" >&2
+	! ${DEBUG:-false} || echo "Debug: $*" >&2
 }
 
 
@@ -185,7 +220,7 @@ function _grabber_silent
 }
 function grabber_task
 {
-	_grabber_silent || echo -n "$@... "
+	_grabber_silent || printf '%s' "${*}... "
 }
 function grabber_ok
 {
